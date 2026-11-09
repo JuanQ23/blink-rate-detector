@@ -12,7 +12,9 @@ splits into activity segments with a blink-rate breakdown per
 activity, per-minute bars colored by activity, and an activity
 column in the CSV export. Optional auto-detection
 (Windows) can switch activities for you by watching which window
-is in front; titles are read locally and never stored.
+is in front; titles are read locally and never stored. Also
+includes low blink rate alerts: a badge with blinking dry eyes
+pulls down from the top of the screen when your rate stays low.
 
 How it works:
   * Haar face cascade finds the face, Haar eye cascade finds the eyes.
@@ -207,6 +209,16 @@ class BlinkDetectorApp(tk.Tk):
         self._breakdown_text_cache = ""
         self.auto_activity_var = tk.BooleanVar(value=False)
         self._auto_tick_count = 0
+        # Low blink rate alert state
+        self.alert_enabled_var = tk.BooleanVar(value=True)
+        self.alert_threshold_var = tk.IntVar(value=8)
+        self.alert_sustain_var = tk.IntVar(value=60)
+        self._low_since: float | None = None
+        self._alert_cooldown_until = 0.0
+        self._alert_window = None
+        self._alert_canvas = None
+        self._alert_text_var = None
+        self._alert_anim_id = None
 
         # Settings (bound to sliders)
         self.threshold_var = tk.DoubleVar(value=0.5)
@@ -315,6 +327,28 @@ class BlinkDetectorApp(tk.Tk):
         self.breakdown_text.pack(fill="x")
         self.breakdown_text.insert("1.0", "Start the camera and pick what you're doing.")
         self.breakdown_text.config(state="disabled")
+
+        # Low blink rate alerts
+        alert_box = ttk.LabelFrame(right, text="Low blink rate alerts")
+        alert_box.pack(fill="x", pady=(10, 0))
+        ttk.Checkbutton(
+            alert_box, text="Badge drops down from the top of the screen",
+            variable=self.alert_enabled_var).pack(anchor="w")
+        arow = ttk.Frame(alert_box)
+        arow.pack(fill="x", pady=(6, 0))
+        ttk.Label(arow, text="Warn below").pack(side="left")
+        ttk.Spinbox(arow, from_=3, to=20, width=4,
+                    textvariable=self.alert_threshold_var).pack(side="left", padx=(4, 4))
+        ttk.Label(arow, text="blinks/min, sustained for").pack(side="left")
+        ttk.Spinbox(arow, from_=15, to=300, increment=15, width=5,
+                    textvariable=self.alert_sustain_var).pack(side="left", padx=(4, 4))
+        ttk.Label(arow, text="sec").pack(side="left")
+        ttk.Label(
+            alert_box,
+            text="A badge with a pair of blinking dry eyes slides down from the top\n"
+                 "of the screen. It hides itself once your rate recovers; Dismiss\n"
+                 "silences it for 5 minutes.",
+            foreground="#555").pack(anchor="w", pady=(6, 0))
 
         # Controls
         controls = ttk.LabelFrame(right, text="Controls", padding=10)
@@ -430,6 +464,7 @@ class BlinkDetectorApp(tk.Tk):
         self.video_label.image = None
         self.start_btn.config(state="normal")
         self.stop_btn.config(state="disabled")
+        self._hide_low_rate_alert()
         self.status_var.set("Status: Paused")
 
     def _video_loop(self):
@@ -548,6 +583,143 @@ class BlinkDetectorApp(tk.Tk):
             self.activity_var.set(name)
             self._on_activity_changed()
 
+    # ------------------------------------------------- Low-rate alerts
+    def _update_low_rate_alert(self, elapsed: float, last_60: int,
+                               present_total: float, recent_present: float):
+        """Show/hide the low-blink-rate banner.
+
+        Fires only when the rate over the last 60 session seconds stays
+        below the threshold for the whole sustain period, with enough
+        present time in the window (so stepping away can't trigger it).
+        Recovers with hysteresis (+2/min) so it doesn't flicker.
+        """
+        try:
+            threshold = int(self.alert_threshold_var.get())
+            sustain = int(self.alert_sustain_var.get())
+        except (tk.TclError, ValueError):
+            threshold, sustain = 8, 60
+        if self._alert_text_var is not None and self._alert_window is not None:
+            self._alert_text_var.set(
+                f"Low blink rate — {last_60} in the last minute "
+                f"(healthy is ~15–20). Blink a few times, look far away.")
+        enabled = self.alert_enabled_var.get()
+        low_now = (enabled and self.running and present_total >= 120
+                   and recent_present >= 45 and last_60 < threshold)
+        if low_now:
+            if self._low_since is None:
+                self._low_since = elapsed
+            elif (elapsed - self._low_since >= sustain
+                  and self._alert_window is None
+                  and elapsed >= self._alert_cooldown_until):
+                self._show_low_rate_alert(last_60)
+        else:
+            recovered = last_60 >= threshold + 2
+            if recovered or not enabled or not self.running:
+                self._low_since = None
+                self._hide_low_rate_alert()
+
+    def _show_low_rate_alert(self, last_60: int):
+        if self._alert_window is not None:
+            return
+        win = tk.Toplevel(self)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        try:
+            win.attributes("-alpha", 0.98)
+        except tk.TclError:
+            pass
+        win.configure(bg="#fff3f3", highlightthickness=2,
+                      highlightbackground="#d66")
+        self._alert_text_var = tk.StringVar(
+            value=f"Low blink rate — {last_60} in the last minute "
+                  f"(healthy is ~15–20). Blink a few times, look far away.")
+        canvas = tk.Canvas(win, width=104, height=64, bg="#fff3f3",
+                           highlightthickness=0)
+        canvas.grid(row=0, column=0, padx=(10, 2), pady=8)
+        ttk.Label(win, textvariable=self._alert_text_var,
+                  font=("TkDefaultFont", 11, "bold"), background="#fff3f3",
+                  wraplength=330, justify="left").grid(
+                      row=0, column=1, sticky="w", padx=(2, 6), pady=8)
+        ttk.Button(win, text="Dismiss",
+                   command=self._dismiss_low_rate_alert).grid(
+                       row=0, column=2, padx=(0, 10), pady=8)
+        self._alert_window = win
+        self._alert_canvas = canvas
+        win.update_idletasks()
+        width = max(win.winfo_reqwidth(), 480)
+        height = max(win.winfo_reqheight(), 76)
+        x = (win.winfo_screenwidth() - width) // 2
+        # Pull-down animation: slide from above the screen to the top
+        win.geometry(f"{width}x{height}+{x}+{-height}")
+        self._alert_slide_step(x, -height, height)
+        self._alert_blink_eyes(1.0)
+
+    def _alert_slide_step(self, x: int, y: int, height: int):
+        if self._alert_window is None or not self._alert_window.winfo_exists():
+            return
+        y = min(y + 8, 0)
+        self._alert_window.geometry(f"+{x}+{y}")
+        if y < 0:
+            self._alert_anim_id = self.after(
+                12, lambda: self._alert_slide_step(x, y, height))
+
+    def _alert_blink_eyes(self, openness: float):
+        if self._alert_window is None or self._alert_canvas is None:
+            return
+        if not self._alert_window.winfo_exists():
+            return
+        self._draw_alert_eyes(openness)
+        if openness > 0.5:
+            # stay open ~2.2s, then blink
+            self._alert_anim_id = self.after(2200, lambda: self._alert_blink_eyes(0.08))
+        else:
+            self._alert_anim_id = self.after(170, lambda: self._alert_blink_eyes(1.0))
+
+    def _draw_alert_eyes(self, openness: float):
+        c = self._alert_canvas
+        if c is None:
+            return
+        c.delete("all")
+        # A pair of dry eyes: pinkish whites, a couple of red veins,
+        # iris that disappears as the lid closes.
+        for cx in (30, 74):
+            c.create_oval(cx - 15, 18, cx + 15, 46, fill="#ffecec",
+                          outline="#b55", width=2)
+            # veins
+            c.create_line(cx - 14, 26, cx - 7, 30, fill="#e08a8a", width=1)
+            c.create_line(cx + 14, 38, cx + 8, 34, fill="#e08a8a", width=1)
+            if openness > 0.25:
+                r = 6.5 * openness
+                c.create_oval(cx - r, 32 - r, cx + r, 32 + r,
+                              fill="#5b3a29", outline="")
+                c.create_oval(cx - 2, 30, cx + 2, 34, fill="#1a1a1a", outline="")
+            # upper lid line drops as the eye closes
+            lid_y = 19 + (1.0 - openness) * 13
+            c.create_line(cx - 15, lid_y, cx + 15, lid_y, fill="#b55", width=2)
+
+    def _dismiss_low_rate_alert(self):
+        # Dismiss = hide now and stay quiet for 5 session minutes
+        self._alert_cooldown_until = self.elapsed_seconds() + 300.0
+        self._low_since = None
+        self._hide_low_rate_alert()
+
+    def _hide_low_rate_alert(self):
+        if self._alert_anim_id is not None:
+            try:
+                self.after_cancel(self._alert_anim_id)
+            except Exception:
+                pass
+            self._alert_anim_id = None
+        if self._alert_window is not None:
+            try:
+                self._alert_window.destroy()
+            except Exception:
+                pass
+        self._alert_window = None
+        self._alert_canvas = None
+        self._alert_text_var = None
+
+
     def activity_at(self, t: float, elapsed: float) -> str:
         for start, end, name in self.activity_segments:
             seg_end = elapsed if end is None else end
@@ -647,6 +819,7 @@ class BlinkDetectorApp(tk.Tk):
             self.bph_rolling_var.set("collecting…")
 
         self._auto_detect_tick()
+        self._update_low_rate_alert(elapsed, last_60, elapsed, min(elapsed, 60.0))
         self._update_breakdown_panel(elapsed)
         self._draw_minute_chart(elapsed)
         self.after(500, self._update_stats_loop)
@@ -716,6 +889,9 @@ class BlinkDetectorApp(tk.Tk):
         self.elapsed_before_pause = 0.0
         self.session_start = time.monotonic() if self.running else None
         self.activity_segments.clear()
+        self._low_since = None
+        self._alert_cooldown_until = 0.0
+        self._hide_low_rate_alert()
         self._activity_color_idx.clear()
         if self.running:
             self._open_activity_segment(0.0)
