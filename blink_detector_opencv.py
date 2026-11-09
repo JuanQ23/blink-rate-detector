@@ -13,7 +13,9 @@ activity, per-minute bars colored by activity, and an activity
 column in the CSV export. Optional auto-detection
 (Windows) can switch activities for you by watching which window
 is in front; titles are read locally and never stored. Also
-includes low blink rate alerts: a badge with blinking dry eyes
+includes breathing-rate estimation from chest/shoulder motion
+(optical flow on the same frames), and low blink rate alerts:
+a badge with blinking dry eyes
 pulls down from the top of the screen when your rate stays low.
 
 How it works:
@@ -59,6 +61,11 @@ except ImportError:  # pragma: no cover
     cv2 = None
 
 try:
+    import numpy as np
+except ImportError:  # pragma: no cover
+    np = None
+
+try:
     from PIL import Image, ImageTk
 except ImportError:  # pragma: no cover
     Image = ImageTk = None
@@ -75,6 +82,86 @@ ACTIVITY_PALETTE = [("#dceeff", "#1f77b4"), ("#ffe9d6", "#e67e22"),
                     ("#fdf3c4", "#b7950b"), ("#d9f2f0", "#148f77"),
                     ("#ffe0ec", "#c2185b"), ("#e8e8e8", "#666666")]
 DEFAULT_ACTIVITY = "Uncategorized"
+
+# --- Breath-rate estimation from chest/shoulder motion ----------------
+def estimate_breath_rate(samples, now: float, window: float = 45.0):
+    """Estimate breaths/min from (elapsed, median vertical motion) samples.
+
+    The per-frame dy samples are integrated into a chest-position signal,
+    resampled at 10 Hz, detrended, and band-passed to the breathing band
+    (0.10–0.50 Hz). The rate is the FFT peak inside 0.12–0.45 Hz
+    (7–27 breaths/min). Returns (bpm | None, waveform, quality) where
+    quality is "good", "weak", "low signal", "warming up",
+    "interrupted", or "unavailable". Pure signal processing — no camera.
+    """
+    if np is None:
+        return None, [], "unavailable"
+    pts = [(t, d) for (t, d) in samples if t >= now - window]
+    if len(pts) < 50:
+        return None, [], "warming up"
+    # Only use samples after the last big gap (stepping away, pausing)
+    last_gap_end = 0
+    for i in range(1, len(pts)):
+        if pts[i][0] - pts[i - 1][0] > 2.0:
+            last_gap_end = i
+    pts = pts[last_gap_end:]
+    if len(pts) < 50 or pts[-1][0] - pts[0][0] < 25.0:
+        return None, [], "warming up"
+    ts = np.array([p[0] for p in pts], dtype=float)
+    ds = np.array([p[1] for p in pts], dtype=float)
+    grid = np.arange(ts[0], ts[-1], 0.1)
+    if len(grid) < 250:
+        return None, [], "warming up"
+    k = 100  # 10-second moving average detrend
+    kernel = np.ones(k) / k
+    # Display waveform: integrated chest position, detrended, band-passed.
+    pos = np.interp(grid, ts, np.cumsum(ds))
+    wave_src = pos - np.convolve(pos, kernel, mode="same")
+    # Rate spectrum: use the per-frame displacement (dy) signal itself,
+    # NOT the integrated position — integrating turns white motion noise
+    # into Brownian noise whose spectrum piles up at the lowest
+    # frequencies and can fake a confident slow "breath".
+    sig = np.interp(grid, ts, ds)
+    sig = sig - np.convolve(sig, kernel, mode="same")
+    spec = np.fft.rfft(sig * np.hanning(len(sig)))
+    freqs = np.fft.rfftfreq(len(sig), d=0.1)
+    mag = np.abs(spec)
+    band = (freqs >= 0.10) & (freqs <= 0.50)
+    peak_band = (freqs >= 0.12) & (freqs <= 0.45)
+    wave_spec = np.fft.rfft(wave_src)
+    filt = np.where(band, wave_spec, 0.0)
+    wave = np.fft.irfft(filt, n=len(wave_src))[-300:].tolist()
+    if not band.any() or not peak_band.any():
+        return None, wave, "low signal"
+    peak_idx = int(np.argmax(np.where(peak_band, mag, 0.0)))
+    med = float(np.median(mag[band])) or 1e-9
+    ratio = float(mag[peak_idx]) / med
+    if ratio < 2.0:
+        return None, wave, "low signal"
+    bpm = float(freqs[peak_idx] * 60.0)
+    if ratio < 3.0:
+        return bpm, wave, "weak"
+    # "Good" also requires stationarity: the two halves of the window
+    # must independently agree on the rate. Random motion produces a
+    # lucky spectral peak in one stretch, rarely the same one twice.
+    half = len(sig) // 2
+    half_bpms = []
+    for seg in (sig[:half], sig[half:]):
+        sm = np.abs(np.fft.rfft(seg * np.hanning(len(seg))))
+        sf = np.fft.rfftfreq(len(seg), d=0.1)
+        sb = (sf >= 0.12) & (sf <= 0.45)
+        if not sb.any():
+            half_bpms = []
+            break
+        half_bpms.append(float(sf[sb][int(np.argmax(sm[sb]))] * 60.0))
+    if (len(half_bpms) == 2
+            and abs(half_bpms[0] - half_bpms[1]) <= 2.5
+            and abs(half_bpms[0] - bpm) <= 3.0
+            and abs(half_bpms[1] - bpm) <= 3.0):
+        return bpm, wave, "good"
+    return bpm, wave, "weak"
+
+
 
 # --- Auto-detection of the foreground window (Windows only) -------------
 # Every couple of seconds the app can look at which window is in front
@@ -219,6 +306,14 @@ class BlinkDetectorApp(tk.Tk):
         self._alert_canvas = None
         self._alert_text_var = None
         self._alert_anim_id = None
+        # Breathing state
+        self.breath_samples = deque(maxlen=6000)
+        self._breath_points = None
+        self._breath_prev_gray = None
+        self._breath_last_detect = -10.0
+        self._breath_smooth = None
+        self._breath_wave: list[float] = []
+        self._breath_session: list[float] = []
 
         # Settings (bound to sliders)
         self.threshold_var = tk.DoubleVar(value=0.5)
@@ -293,6 +388,24 @@ class BlinkDetectorApp(tk.Tk):
                   ).grid(row=len(rows), column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         # Per-minute chart
+        # Breathing
+        breath_box = ttk.LabelFrame(right, text="Breathing (from chest motion)", padding=10)
+        breath_box.pack(fill="x", pady=(10, 0))
+        self.breath_rate_var = tk.StringVar(value="— breaths/min")
+        ttk.Label(breath_box, textvariable=self.breath_rate_var,
+                  font=("TkDefaultFont", 13, "bold")).pack(anchor="w")
+        self.breath_wave_canvas = tk.Canvas(breath_box, height=54, bg="white",
+                                            highlightthickness=1,
+                                            highlightbackground="#ccc")
+        self.breath_wave_canvas.pack(fill="x", pady=(6, 4))
+        self.breath_status_var = tk.StringVar(
+            value="Start the camera and sit so your chest and shoulders are in frame.")
+        ttk.Label(breath_box, textvariable=self.breath_status_var, foreground="#555",
+                  wraplength=300, justify="left").pack(anchor="w")
+        self.breath_session_var = tk.StringVar(value="Session avg: —")
+        ttk.Label(breath_box, textvariable=self.breath_session_var,
+                  foreground="#555").pack(anchor="w", pady=(2, 0))
+
         chart_box = ttk.LabelFrame(right, text="Blinks per minute (last 15 minutes)", padding=8)
         chart_box.pack(fill="x", pady=(10, 0))
         self.chart_canvas = tk.Canvas(chart_box, height=110, bg="white",
@@ -497,12 +610,14 @@ class BlinkDetectorApp(tk.Tk):
                 cv2.rectangle(frame, (x + ex, y + ey),
                               (x + ex + ew, y + ey + eh), (255, 0, 0), 2)
             self._process_openness(openness)
+            self._track_breathing(frame, (x, y, w, h))
             state = "Open" if eyes_found else "Closed?"
             self.status_var.set(
                 f"Status: Face detected  •  Eyes {'found' if eyes_found else 'not found'}  •  {state}")
         else:
             # No face: do not count this as a blink; just wait.
             self.eyes_closed_frames = 0
+            self._reset_breath_tracking()
             self.status_var.set("Status: No face detected — look toward the camera")
 
         if openness is not None:
@@ -720,6 +835,124 @@ class BlinkDetectorApp(tk.Tk):
         self._alert_text_var = None
 
 
+    # ---------------------------------------------------------- Breathing
+    def _breath_roi(self, frame_shape, face_box):
+        """Chest/shoulder region below the face, or None if too small."""
+        H, W = frame_shape[:2]
+        x, y, w, h = face_box
+        x0 = max(0, int(x - 0.4 * w))
+        x1 = min(W, int(x + 1.4 * w))
+        y0 = min(H, int(y + h * 1.05))
+        if H - y0 < 40 or x1 - x0 < 40:
+            return None
+        return (x0, y0, x1, H)
+
+    def _track_breathing(self, frame, face_box):
+        """Track chest/shoulder motion with optical flow.
+
+        Appends (session elapsed, median vertical displacement) samples.
+        Frames are processed and discarded, exactly like blink detection.
+        """
+        if np is None or cv2 is None:
+            return
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        roi = self._breath_roi(frame.shape, face_box)
+        if roi is None:
+            self._breath_prev_gray = gray
+            return
+        x0, y0, x1, y1 = roi
+        cv2.rectangle(frame, (x0, y0), (x1, y1), (0, 200, 200), 1)
+        elapsed = self.elapsed_seconds()
+        need_detect = (self._breath_points is None
+                       or len(self._breath_points) < 15
+                       or elapsed - self._breath_last_detect > 5.0)
+        if need_detect or self._breath_prev_gray is None:
+            mask = np.zeros(gray.shape, dtype=np.uint8)
+            mask[y0:y1, x0:x1] = 255
+            self._breath_points = cv2.goodFeaturesToTrack(
+                gray, 60, 0.01, 8, mask=mask)
+            self._breath_last_detect = elapsed
+            self._breath_prev_gray = gray
+            return
+        new_pts, status, _err = cv2.calcOpticalFlowPyrLK(
+            self._breath_prev_gray, gray, self._breath_points, None,
+            winSize=(21, 21), maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
+        self._breath_prev_gray = gray
+        if new_pts is None or status is None:
+            self._breath_points = None
+            return
+        ok = status.reshape(-1) == 1
+        if int(ok.sum()) < 8:
+            self._breath_points = None
+            return
+        old = self._breath_points[ok].reshape(-1, 2)
+        new = new_pts[ok].reshape(-1, 2)
+        inside = ((new[:, 0] >= x0) & (new[:, 0] <= x1)
+                  & (new[:, 1] >= y0) & (new[:, 1] <= y1))
+        if int(inside.sum()) >= 8:
+            dy = float(np.median((new[inside] - old[inside])[:, 1]))
+            self.breath_samples.append((elapsed, dy))
+            self._breath_points = new[inside].reshape(-1, 1, 2).astype(np.float32)
+        else:
+            self._breath_points = None
+
+    def _reset_breath_tracking(self):
+        self._breath_points = None
+        self._breath_prev_gray = None
+
+    def _update_breathing_panel(self, elapsed: float):
+        bpm, wave, quality = estimate_breath_rate(
+            list(self.breath_samples), elapsed)
+        if wave:
+            self._breath_wave = wave
+        if bpm is not None:
+            if self._breath_smooth is None:
+                self._breath_smooth = bpm
+            else:
+                step = max(-3.0, min(3.0, bpm - self._breath_smooth))
+                self._breath_smooth += 0.3 * step
+            if quality == "good":
+                self._breath_session.append(self._breath_smooth)
+        if bpm is None:
+            self.breath_rate_var.set("— breaths/min")
+            self.breath_status_var.set({
+                "warming up": "Warming up — needs ~25 s of chest motion.",
+                "low signal": "Low signal — sit still, chest & shoulders in frame.",
+                "interrupted": "Signal interrupted — waiting for a clean stretch.",
+                "unavailable": "Breathing needs numpy (it comes with OpenCV).",
+            }.get(quality, "Watching your chest and shoulders…"))
+        else:
+            self.breath_rate_var.set(f"{self._breath_smooth:.1f} breaths/min")
+            self.breath_status_var.set(
+                "Good signal — watching your chest and shoulders."
+                if quality == "good"
+                else "Weak signal — usable, but sit a little stiller.")
+        if self._breath_session:
+            avg = sum(self._breath_session) / len(self._breath_session)
+            self.breath_session_var.set(f"Session avg: {avg:.1f} breaths/min")
+        self._draw_breath_wave()
+
+    def _draw_breath_wave(self):
+        c = self.breath_wave_canvas
+        c.delete("all")
+        w = max(c.winfo_width(), 60)
+        h = max(c.winfo_height(), 40)
+        wave = self._breath_wave
+        c.create_line(0, h / 2, w, h / 2, fill="#dddddd")
+        if len(wave) < 10:
+            c.create_text(w / 2, h / 2, fill="#888",
+                          text="breathing waveform will appear here")
+            return
+        peak = max(max(wave), -min(wave), 1e-6)
+        pts = []
+        for i, v in enumerate(wave):
+            x = i / (len(wave) - 1) * (w - 8) + 4
+            y = h / 2 - (v / peak) * (h / 2 - 6)
+            pts.extend([x, y])
+        c.create_line(*pts, fill="#0e9594", width=2, smooth=True)
+
+
     def activity_at(self, t: float, elapsed: float) -> str:
         for start, end, name in self.activity_segments:
             seg_end = elapsed if end is None else end
@@ -820,6 +1053,7 @@ class BlinkDetectorApp(tk.Tk):
 
         self._auto_detect_tick()
         self._update_low_rate_alert(elapsed, last_60, elapsed, min(elapsed, 60.0))
+        self._update_breathing_panel(elapsed)
         self._update_breakdown_panel(elapsed)
         self._draw_minute_chart(elapsed)
         self.after(500, self._update_stats_loop)
@@ -892,6 +1126,11 @@ class BlinkDetectorApp(tk.Tk):
         self._low_since = None
         self._alert_cooldown_until = 0.0
         self._hide_low_rate_alert()
+        self.breath_samples.clear()
+        self._breath_smooth = None
+        self._breath_wave = []
+        self._breath_session = []
+        self._reset_breath_tracking()
         self._activity_color_idx.clear()
         if self.running:
             self._open_activity_segment(0.0)
@@ -937,6 +1176,10 @@ class BlinkDetectorApp(tk.Tk):
                     bpm = s["blinks"] / mins if mins > 0 else 0.0
                     f.write(f"  {s['name']}: {mins:.1f} min, {s['blinks']} blinks, "
                             f"{bpm:.1f} blinks/min ({bpm * 60:,.0f} blinks/hour)\n")
+            if self._breath_session:
+                avg_b = sum(self._breath_session) / len(self._breath_session)
+                f.write(f"\nBreathing (camera estimate): session avg {avg_b:.1f} breaths/min "
+                        f"over {len(self._breath_session) * 0.5 / 60:.1f} min of good signal\n")
         messagebox.showinfo("Saved", f"Saved:\n{path}\n{summary_path}")
 
     def on_close(self):

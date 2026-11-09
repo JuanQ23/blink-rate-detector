@@ -4,7 +4,9 @@ A Python GUI program that uses your webcam to detect blinks in real time and sho
 
 ## Files in this repo
 
-- **`blink_detector.py`** — the main program (MediaPipe Face Mesh). Includes the live per-minute plot, 20-20-20 break notifications, presence detection, and activity categories described below. Use this one if you can.
+- **`blink_detector_qt.py`** — ⭐ **the modern PySide6 (Qt) version — start here.** A dark, modern UI with every feature: live plot, 20-20-20 breaks, presence detection, activity categories with Windows auto-detect, and the low-blink-rate dry-eyes badge (with a smooth slide-down animation). One file instead of two: it uses the MediaPipe engine when MediaPipe is installed and automatically falls back to the OpenCV engine when it isn't — the header shows which engine is active.
+- **`requirements_qt.txt`** — dependencies for the Qt version (PySide6 + OpenCV; MediaPipe optional).
+- **`blink_detector.py`** — the original Tkinter program (MediaPipe Face Mesh). Includes the live per-minute plot, 20-20-20 break notifications, presence detection, and activity categories described below. Use this one if you can.
 - **`requirements.txt`** — dependencies for the main program (pinned `mediapipe==0.10.21`, Python 3.11/3.12 recommended).
 - **`blink_detector_opencv.py`** — a fallback that uses only OpenCV Haar cascades, for Python versions where MediaPipe won't install (3.13+). It has the core GUI, blink stats, and activity categories, but not the line plot, break notifications, or presence detection, and it is less accurate.
 - **`requirements_opencv.txt`** — dependencies for the fallback (OpenCV + Pillow only).
@@ -19,6 +21,7 @@ A Python GUI program that uses your webcam to detect blinks in real time and sho
 - **Blinks / hour (last 5 min)** — recent, rolling rate (steadier for long sessions)
 - **Live EAR graph** — watch your eye-openness dip below the blink threshold
 - **Blinks per minute over time (plot)** — a live line plot in the main window (most recent 30 minutes), with a shaded "typical 15–20/min" band. **Open full plot** shows the whole session in a large window with average/peak stats, and **Save per-minute data (CSV)** exports minute-by-minute counts
+- **Breathing rate** — the region below your face (chest and shoulders, outlined in teal on the video) is tracked with optical flow; the slow rise-and-fall is filtered to the breathing band and shown as breaths/min with a live waveform, a signal-quality status, and a session average in the saved summary. Needs your chest/shoulders in frame, ~25 s of fairly still sitting for the first reading, and it will say "low signal" rather than guess when you move around. Available in all three versions
 - **Low blink rate badge** — if your blinks over the last minute stay below the threshold (default 8/min) for the sustain period (default 60 s), a badge with a pair of blinking dry eyes pulls down from the top of the screen. It hides itself once your rate recovers (with a little hysteresis so it doesn't flicker), Dismiss silences it for 5 minutes, and time away from the camera can't trigger it
 - **20-20-20 break notifications** — every 20 minutes of camera-on session time, a popup (with a beep, brought to the front) reminds you to look at something 20+ feet away for 20 seconds, with a live countdown, **Snooze 5 min**, **Skip**, and a breaks-taken counter. The timer pauses when the camera is paused. Interval and look-away duration are adjustable — set the interval to 1 minute to test it
 - **Presence detection** — if your face isn't seen for more than the grace period (default 5 seconds, adjustable 2–30s), you're counted as *away*: that stretch is shaded red on the plot, a minute that is more than half away is marked unreliable (red ✕, line breaks around it instead of showing a fake dip), away time is excluded from all rate calculations, the 20-20-20 timer pauses, and the stats panel shows your total *Time away (excluded)*. Pausing the camera manually is not counted as away
@@ -47,7 +50,19 @@ pip install -r requirements.txt
 
 ## Run
 
+Qt version (recommended):
+
 ```bash
+pip install -r requirements_qt.txt
+python blink_detector_qt.py
+```
+
+> All requirements files pin `opencv-python` to the 4.x line: OpenCV 5 removed the Haar cascade API (`cv2.CascadeClassifier`) that the OpenCV detection engine relies on.
+
+Original Tkinter version:
+
+```bash
+pip install -r requirements.txt
 python blink_detector.py
 ```
 

@@ -1,4 +1,4 @@
-opencv-python>=4.8
+opencv-python>=4.8,<5  # <5: OpenCV 5 removed cv2.CascadeClassifier (Haar cascades)
 Pillow>=10.0
 # No mediapipe — use this file for blink_detector_opencv.py.
 # tkinter is included with Python on Windows/macOS.

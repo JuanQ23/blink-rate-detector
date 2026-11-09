@@ -1,4 +1,4 @@
-opencv-python>=4.8
+opencv-python>=4.8,<5  # <5: OpenCV 5 removed cv2.CascadeClassifier (Haar cascades)
 # Pinned: 0.10.21 is a known-good release that includes the classic
 # MediaPipe Solutions Face Mesh API (mp.solutions.face_mesh) this
 # program uses, with prebuilt wheels for Python 3.9-3.12 on Windows.
