@@ -22,6 +22,11 @@ Detects blinks from your webcam in real time and reports:
     session is split into activity segments. You get a live
     blink-rate breakdown per activity, activity bands on the
     plot, and activity columns in the CSV exports.
+  • Optional auto-detection (Windows): the foreground window's
+    program and title are checked every ~2 seconds and matched
+    to an activity (YouTube/Netflix/etc. in a browser, known
+    coding and call apps, fullscreen non-browser app = video
+    games). Titles are read locally and never stored.
 
 How it works:
   MediaPipe Face Mesh locates 6 landmarks around each eye.
@@ -87,6 +92,106 @@ ACTIVITY_PALETTE = [("#dceeff", "#1f77b4"), ("#ffe9d6", "#e67e22"),
                     ("#ffe0ec", "#c2185b"), ("#e8e8e8", "#666666")]
 DEFAULT_ACTIVITY = "Uncategorized"
 
+# --- Auto-detection of the foreground window (Windows only) -------------
+# Every couple of seconds the app can look at which window is in front
+# (process name + window title, read locally via the Windows API —
+# nothing is stored or sent anywhere) and classify it into an activity.
+
+_BROWSER_PROCS = {"chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+                  "opera.exe", "opera_gx.exe", "vivaldi.exe", "arc.exe",
+                  "chromium.exe"}
+_CODE_PROCS = {"code.exe", "cursor.exe", "pycharm.exe", "pycharm64.exe",
+               "idea.exe", "idea64.exe", "webstorm.exe", "webstorm64.exe",
+               "rider.exe", "rider64.exe", "devenv.exe", "notepad++.exe",
+               "sublime_text.exe", "atom.exe"}
+_CALL_PROCS = {"zoom.exe", "ms-teams.exe", "teams.exe", "webex.exe",
+               "skype.exe"}
+_VIDEO_PLAYER_PROCS = {"vlc.exe", "mpc-hc.exe", "mpc-hc64.exe",
+                       "potplayer.exe", "potplayer64.exe", "wmplayer.exe",
+                       "mpv.exe", "kmplayer.exe"}
+_SHOW_TITLE_KEYWORDS = ["netflix", "hulu", "disney+", "disney plus", "hbo",
+                        "max.com", "prime video", "amazon prime", "peacock",
+                        "paramount+", "apple tv+", "crunchyroll", "twitch",
+                        "plex"]
+
+
+def foreground_window_info():
+    """(process_name, window_title, is_fullscreen) for the front window.
+
+    Windows only; returns None anywhere else or on any error. Everything
+    is read locally and used immediately — titles are never stored.
+    """
+    import sys
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd:
+            return None
+
+        length = user32.GetWindowTextLengthW(hwnd)
+        buf = ctypes.create_unicode_buffer(length + 1)
+        user32.GetWindowTextW(hwnd, buf, length + 1)
+        title = buf.value or ""
+
+        pid = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        process = ""
+        if pid.value:
+            handle = kernel32.OpenProcess(0x1000, False, pid.value)  # QUERY_LIMITED
+            if handle:
+                try:
+                    path_buf = ctypes.create_unicode_buffer(1024)
+                    size = wintypes.DWORD(1024)
+                    if kernel32.QueryFullProcessImageNameW(
+                            handle, 0, path_buf, ctypes.byref(size)):
+                        process = path_buf.value.replace("\\", "/").rsplit("/", 1)[-1]
+                finally:
+                    kernel32.CloseHandle(handle)
+
+        rect = wintypes.RECT()
+        fullscreen = False
+        if user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            screen_w = user32.GetSystemMetrics(0)
+            screen_h = user32.GetSystemMetrics(1)
+            fullscreen = (rect.left <= 0 and rect.top <= 0
+                          and rect.right >= screen_w and rect.bottom >= screen_h)
+        return (process, title, fullscreen)
+    except Exception:
+        return None
+
+
+def classify_activity(process: str, title: str, fullscreen: bool):
+    """Map a foreground window to an activity name, or None to keep the
+    current activity (unknown windows never force a guess)."""
+    p = (process or "").lower()
+    t = (title or "").lower()
+    if not p and not t:
+        return None
+    if p in ("python.exe", "pythonw.exe"):
+        return None  # the detector's own window — never switch for it
+    if "youtube" in t:
+        return "YouTube"
+    if any(k in t for k in _SHOW_TITLE_KEYWORDS):
+        return "Watching a show"
+    if p in _CALL_PROCS or "zoom meeting" in t or "teams meeting" in t:
+        return "Video call"
+    if p in _CODE_PROCS:
+        return "Coding / work"
+    if p in _VIDEO_PLAYER_PROCS:
+        return "Watching a show"
+    if p in _BROWSER_PROCS:
+        return "Browsing"
+    if fullscreen and p not in ("explorer.exe",):
+        return "Video games"
+    return None
+
+
 
 def euclidean(a, b) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -138,6 +243,8 @@ class BlinkDetectorApp(tk.Tk):
         self.activity_segments: list[list] = []
         self._activity_color_idx: dict[str, int] = {}
         self._breakdown_text_cache = ""
+        self.auto_activity_var = tk.BooleanVar(value=False)
+        self._auto_tick_count = 0
 
         # Settings (bound to sliders)
         self.threshold_var = tk.DoubleVar(value=0.21)
@@ -274,6 +381,8 @@ class BlinkDetectorApp(tk.Tk):
         self.activity_combo.bind("<<ComboboxSelected>>", self._on_activity_changed)
         self.activity_combo.bind("<Return>", self._on_activity_changed)
         self.activity_combo.bind("<FocusOut>", self._on_activity_changed)
+        ttk.Checkbutton(activity_box, text="Auto-detect from the active window (Windows)",
+                        variable=self.auto_activity_var).pack(anchor="w", pady=(6, 0))
         ttk.Label(activity_box,
                   text="Pick what you're doing — or type your own label and\n"
                        "press Enter. Switching starts a new segment, and the\n"
@@ -635,6 +744,23 @@ class BlinkDetectorApp(tk.Tk):
         elif not self.activity_segments:
             self._open_activity_segment(self.elapsed_seconds())
 
+    def _auto_detect_tick(self):
+        """Poll the foreground window (~every 2s) and switch activity."""
+        if not self.auto_activity_var.get():
+            return
+        if not self.running or self.session_start is None:
+            return
+        self._auto_tick_count += 1
+        if self._auto_tick_count % 4 != 0:  # stats loop runs every 500 ms
+            return
+        info = foreground_window_info()
+        if not info:
+            return
+        name = classify_activity(*info)
+        if name and name != self._activity_name():
+            self.activity_var.set(name)
+            self._on_activity_changed()
+
     def activity_at(self, t: float, elapsed: float) -> str:
         for start, end, name in self.activity_segments:
             seg_end = elapsed if end is None else end
@@ -780,6 +906,7 @@ class BlinkDetectorApp(tk.Tk):
             remaining = max(self.next_break_at - elapsed, 0)
             self.next_break_var.set(f"{int(remaining // 60)}:{int(remaining % 60):02d}")
         self._check_break_timer(elapsed)
+        self._auto_detect_tick()
         self._update_breakdown_panel(elapsed)
 
         self._draw_minute_chart(elapsed)
