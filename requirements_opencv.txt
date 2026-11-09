@@ -1,0 +1,5 @@
+opencv-python>=4.8
+Pillow>=10.0
+# No mediapipe — use this file for blink_detector_opencv.py.
+# tkinter is included with Python on Windows/macOS.
+# On Ubuntu/Debian, if tkinter is missing: sudo apt install python3-tk

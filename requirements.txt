@@ -1,0 +1,9 @@
+opencv-python>=4.8
+# Pinned: 0.10.21 is a known-good release that includes the classic
+# MediaPipe Solutions Face Mesh API (mp.solutions.face_mesh) this
+# program uses, with prebuilt wheels for Python 3.9-3.12 on Windows.
+# Use Python 3.11 or 3.12 — newer Pythons (3.13+) may have no wheel.
+mediapipe==0.10.21
+Pillow>=10.0
+# tkinter is included with Python on Windows/macOS.
+# On Ubuntu/Debian, if tkinter is missing: sudo apt install python3-tk
