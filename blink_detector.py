@@ -17,6 +17,11 @@ Detects blinks from your webcam in real time and reports:
     periods are shaded red on the plot, minutes that are mostly
     away are marked unreliable, away time is excluded from the
     rate calculations, and the 20-20-20 timer pauses while away.
+  • Activity categories: tag what you are doing (video games,
+    watching a show, YouTube, your own custom labels…) and the
+    session is split into activity segments. You get a live
+    blink-rate breakdown per activity, activity bands on the
+    plot, and activity columns in the CSV exports.
 
 How it works:
   MediaPipe Face Mesh locates 6 landmarks around each eye.
@@ -70,6 +75,18 @@ except ImportError:  # pragma: no cover
 LEFT_EYE = [33, 160, 158, 133, 153, 144]
 RIGHT_EYE = [362, 385, 387, 263, 373, 380]
 
+# Activity categories: pick one (or type your own) to tag what you are
+# doing; the session splits into segments and blink rates are reported
+# per activity. Each activity gets a (plot band, legend) color pair,
+# assigned in the order activities first appear.
+ACTIVITY_PRESETS = ["Video games", "Watching a show", "YouTube", "Reading",
+                    "Coding / work", "Video call", "Browsing", "Other"]
+ACTIVITY_PALETTE = [("#dceeff", "#1f77b4"), ("#ffe9d6", "#e67e22"),
+                    ("#e6f4d7", "#2e9e4f"), ("#f3e2fd", "#8e44ad"),
+                    ("#fdf3c4", "#b7950b"), ("#d9f2f0", "#148f77"),
+                    ("#ffe0ec", "#c2185b"), ("#e8e8e8", "#666666")]
+DEFAULT_ACTIVITY = "Uncategorized"
+
 
 def euclidean(a, b) -> float:
     return math.hypot(a[0] - b[0], a[1] - b[1])
@@ -114,6 +131,13 @@ class BlinkDetectorApp(tk.Tk):
 
         self.ear_below_frames = 0
         self.ear_history: deque[float] = deque(maxlen=90)
+
+        # --- Activity segments (session-elapsed seconds) ---
+        # [start, end_or_None, name]; the open segment runs to "now".
+        self.activity_var = tk.StringVar(value=DEFAULT_ACTIVITY)
+        self.activity_segments: list[list] = []
+        self._activity_color_idx: dict[str, int] = {}
+        self._breakdown_text_cache = ""
 
         # Settings (bound to sliders)
         self.threshold_var = tk.DoubleVar(value=0.21)
@@ -239,6 +263,32 @@ class BlinkDetectorApp(tk.Tk):
         ttk.Button(plot_btns, text="Save per-minute data (CSV)…",
                    command=self.save_per_minute_csv).pack(
             side="left", fill="x", expand=True, padx=(6, 0))
+
+        # Activity categories
+        activity_box = ttk.LabelFrame(right, text="What are you doing?", padding=10)
+        activity_box.pack(fill="x", pady=(10, 0))
+        self.activity_combo = ttk.Combobox(
+            activity_box, textvariable=self.activity_var,
+            values=ACTIVITY_PRESETS)
+        self.activity_combo.pack(fill="x")
+        self.activity_combo.bind("<<ComboboxSelected>>", self._on_activity_changed)
+        self.activity_combo.bind("<Return>", self._on_activity_changed)
+        self.activity_combo.bind("<FocusOut>", self._on_activity_changed)
+        ttk.Label(activity_box,
+                  text="Pick what you're doing — or type your own label and\n"
+                       "press Enter. Switching starts a new segment, and the\n"
+                       "breakdown below keeps a separate blink rate for each\n"
+                       "activity. Away time is not counted against any of them.",
+                  foreground="#666666", justify="left").pack(anchor="w", pady=(6, 0))
+
+        breakdown_box = ttk.LabelFrame(right, text="Blink rate by activity", padding=8)
+        breakdown_box.pack(fill="x", pady=(10, 0))
+        self.breakdown_text = tk.Text(breakdown_box, height=6, wrap="word",
+                                      relief="flat", bg="#f7f7f7",
+                                      font=("TkDefaultFont", 10))
+        self.breakdown_text.pack(fill="x")
+        self.breakdown_text.insert("1.0", "Start the camera and pick what you're doing.")
+        self.breakdown_text.config(state="disabled")
 
         # Controls
         controls = ttk.LabelFrame(right, text="Controls", padding=10)
@@ -380,6 +430,10 @@ class BlinkDetectorApp(tk.Tk):
         self.running = True
         self.start_btn.config(state="disabled")
         self.stop_btn.config(state="normal")
+        # Open an activity segment unless one is already open (segments
+        # stay open across pauses — the session clock freezes with them)
+        if not self.activity_segments or self.activity_segments[-1][1] is not None:
+            self._open_activity_segment(self.elapsed_seconds())
         self._video_loop()
 
     def stop_camera(self):
@@ -552,6 +606,117 @@ class BlinkDetectorApp(tk.Tk):
             flags.append(minute_len > 0 and away_s > minute_len / 2)
         return flags
 
+    # ---------------------------------------------------------- Activities
+    def _activity_name(self) -> str:
+        return self.activity_var.get().strip() or DEFAULT_ACTIVITY
+
+    def _activity_colors(self, name: str) -> tuple[str, str]:
+        if name not in self._activity_color_idx:
+            self._activity_color_idx[name] = len(self._activity_color_idx)
+        return ACTIVITY_PALETTE[self._activity_color_idx[name] % len(ACTIVITY_PALETTE)]
+
+    def _open_activity_segment(self, at: float):
+        name = self._activity_name()
+        self._activity_colors(name)  # assign its color in first-use order
+        self.activity_segments.append([at, None, name])
+
+    def _on_activity_changed(self, _event=None):
+        """Switching activity closes the open segment and starts a new one."""
+        if self.session_start is None:
+            return  # no session yet — the segment opens when the camera starts
+        name = self._activity_name()
+        if self.activity_segments and self.activity_segments[-1][1] is None:
+            if self.activity_segments[-1][2] == name:
+                return
+            elapsed = self.elapsed_seconds()
+            self.activity_segments[-1][1] = elapsed
+            self.activity_segments.append([elapsed, None, name])
+            self._activity_colors(name)
+        elif not self.activity_segments:
+            self._open_activity_segment(self.elapsed_seconds())
+
+    def activity_at(self, t: float, elapsed: float) -> str:
+        for start, end, name in self.activity_segments:
+            seg_end = elapsed if end is None else end
+            if start <= t < seg_end or (t == seg_end == elapsed):
+                return name
+        return DEFAULT_ACTIVITY
+
+    def activity_stats(self, elapsed: float) -> list[dict]:
+        """Per-activity totals, merged by name, in first-appearance order.
+
+        Durations are *present* time (away time inside a segment is not
+        counted against that activity).
+        """
+        order: list[str] = []
+        agg: dict[str, dict] = {}
+        for start, end, name in self.activity_segments:
+            seg_end = elapsed if end is None else min(end, elapsed)
+            if seg_end <= start:
+                continue
+            present = (seg_end - start) - self._away_overlap(start, seg_end, elapsed)
+            blinks = sum(1 for t in self.blink_timestamps if start <= t < seg_end)
+            if name not in agg:
+                agg[name] = {"name": name, "seconds": 0.0, "blinks": 0}
+                order.append(name)
+            agg[name]["seconds"] += max(present, 0.0)
+            agg[name]["blinks"] += blinks
+        return [agg[n] for n in order if agg[n]["seconds"] > 0 or agg[n]["blinks"] > 0]
+
+    def _activity_bands(self, elapsed: float, window_start_min: float,
+                        window_len_min: float) -> list[tuple[float, float, str]]:
+        """(start, end, band color) in plot-window minute coordinates."""
+        bands = []
+        win_start_s = window_start_min * 60.0
+        win_end_s = win_start_s + window_len_min * 60.0
+        for start, end, name in self.activity_segments:
+            seg_end = elapsed if end is None else end
+            lo, hi = max(start, win_start_s), min(seg_end, win_end_s)
+            if hi > lo:
+                bands.append(((lo - win_start_s) / 60.0, (hi - win_start_s) / 60.0,
+                              self._activity_colors(name)[0]))
+        return bands
+
+    def _dominant_activity(self, minute: int, elapsed: float) -> str:
+        """Activity covering the most of session minute `minute` (0-based)."""
+        lo, hi = minute * 60.0, min((minute + 1) * 60.0, elapsed)
+        best, best_len = DEFAULT_ACTIVITY, 0.0
+        for start, end, name in self.activity_segments:
+            seg_end = elapsed if end is None else end
+            overlap = min(seg_end, hi) - max(start, lo)
+            if overlap > best_len:
+                best, best_len = name, overlap
+        return best
+
+    def _update_breakdown_panel(self, elapsed: float):
+        stats = self.activity_stats(elapsed)
+        if not stats:
+            text = "Start the camera and pick what you're doing."
+            lines = [(text, None)]
+        else:
+            lines = []
+            for s in stats:
+                mins = s["seconds"] / 60.0
+                bpm = s["blinks"] / mins if mins > 0 else 0.0
+                dur_m, dur_s = int(s["seconds"] // 60), int(s["seconds"] % 60)
+                lines.append((f"■ {s['name']} — {dur_m}:{dur_s:02d} • "
+                              f"{s['blinks']} blinks • {bpm:.1f}/min "
+                              f"({bpm * 60:,.0f}/hr)", s["name"]))
+            text = "\n".join(l for l, _ in lines)
+        if text == self._breakdown_text_cache:
+            return
+        self._breakdown_text_cache = text
+        self.breakdown_text.config(state="normal")
+        self.breakdown_text.delete("1.0", "end")
+        for i, (line, name) in enumerate(lines):
+            start = self.breakdown_text.index("end-1c")
+            self.breakdown_text.insert("end", line + ("\n" if i < len(lines) - 1 else ""))
+            if name is not None:
+                tag = f"act_{self._activity_color_idx[name]}"
+                self.breakdown_text.tag_config(tag, foreground=self._activity_colors(name)[1])
+                self.breakdown_text.tag_add(tag, start, f"{start} + 1 chars")
+        self.breakdown_text.config(state="disabled")
+
     def elapsed_seconds(self) -> float:
         if self.session_start is None:
             return self.elapsed_before_pause
@@ -615,6 +780,7 @@ class BlinkDetectorApp(tk.Tk):
             remaining = max(self.next_break_at - elapsed, 0)
             self.next_break_var.set(f"{int(remaining // 60)}:{int(remaining % 60):02d}")
         self._check_break_timer(elapsed)
+        self._update_breakdown_panel(elapsed)
 
         self._draw_minute_chart(elapsed)
         self._refresh_plot_window(elapsed)
@@ -663,12 +829,15 @@ class BlinkDetectorApp(tk.Tk):
     def _draw_line_plot(canvas, values: list[int], first_minute: int = 1,
                         empty_text: str = "",
                         away_per_minute: list[float] | None = None,
-                        unreliable: list[bool] | None = None):
+                        unreliable: list[bool] | None = None,
+                        activity_bands: list[tuple[float, float, str]] | None = None):
         """Draw values as a line plot: x = session minute, y = blinks/min.
 
-        Minutes with away time get a pale-red background column. Minutes
-        flagged unreliable (mostly away) get a red ✕ instead of a point,
-        and the line is broken around them — a fake '0 blinks' dip would
+        Background bands show which activity was happening (colors match
+        the "Blink rate by activity" panel). Minutes with away time get
+        a pale-red background column on top of the band. Minutes flagged
+        unreliable (mostly away) get a red ✕ instead of a point, and
+        the line is broken around them — a fake '0 blinks' dip would
         be misleading.
         """
         c = canvas
@@ -720,6 +889,16 @@ class BlinkDetectorApp(tk.Tk):
                                fill="#eef7ee", outline="")
             c.create_text(left + plot_w - 2, y_of(20) + 2, text="typical 15–20",
                           anchor="ne", font=("TkDefaultFont", 7), fill="#7a9a7a")
+
+        # Activity bands: colored background for each activity segment.
+        # Band coordinates are in minutes relative to the first value.
+        if activity_bands and len(values) > 1:
+            for band_start, band_end, color in activity_bands:
+                x0 = x_of(max(band_start, 0.0))
+                x1 = x_of(min(band_end, float(len(values) - 1)))
+                if x1 > x0:
+                    c.create_rectangle(x0, top, x1, top + plot_h,
+                                       fill=color, outline="")
 
         # Away shading: a pale-red column behind any minute with away time
         has_away = bool(away_per_minute) and any(a > 0.5 for a in away_per_minute)
@@ -780,10 +959,13 @@ class BlinkDetectorApp(tk.Tk):
         away_pm = self.away_seconds_per_minute(elapsed)
         flags = self.unreliable_flags(elapsed, away_pm)
         window = series[-30:]
+        win_start_min = float(len(series) - len(window))
         self._draw_line_plot(self.chart_canvas, window,
                              first_minute=len(series) - len(window) + 1,
                              away_per_minute=away_pm[-30:],
-                             unreliable=flags[-30:])
+                             unreliable=flags[-30:],
+                             activity_bands=self._activity_bands(
+                                 elapsed, win_start_min, float(len(window))))
 
     # ------------------------------------------------------- Plot window
     def open_plot_window(self):
@@ -813,6 +995,7 @@ class BlinkDetectorApp(tk.Tk):
                    command=self.save_per_minute_csv).pack(side="left")
         ttk.Button(btns, text="Close", command=self._close_plot_window).pack(side="right")
         ttk.Label(btns, text="Updates live. Hollow dot = current minute. "
+                             "Background color = activity (see the by-activity panel). "
                              "Red columns = away; red ✕ = unreliable minute.",
                   foreground="#666666").pack(side="left", padx=(10, 0))
 
@@ -844,7 +1027,9 @@ class BlinkDetectorApp(tk.Tk):
         away_pm = self.away_seconds_per_minute(elapsed)
         flags = self.unreliable_flags(elapsed, away_pm)
         self._draw_line_plot(self.plot_canvas, series, first_minute=1,
-                             away_per_minute=away_pm, unreliable=flags)
+                             away_per_minute=away_pm, unreliable=flags,
+                             activity_bands=self._activity_bands(
+                                 elapsed, 0.0, float(len(series))))
         # Average over completed, reliable minutes only
         completed = series[:-1] if len(series) > 1 else series
         reliable_completed = [v for i, v in enumerate(completed)
@@ -856,13 +1041,23 @@ class BlinkDetectorApp(tk.Tk):
         away_total = self.away_seconds_total(elapsed)
         n_unreliable = sum(1 for f in flags if f)
         if self.plot_info_var is not None:
+            act = self.activity_stats(elapsed)
+            act_text = ""
+            if act:
+                parts = []
+                for s in act:
+                    mins = s["seconds"] / 60.0
+                    bpm = s["blinks"] / mins if mins > 0 else 0.0
+                    parts.append(f"{s['name']}: {bpm:.1f}/min")
+                act_text = "  •  by activity — " + ", ".join(parts)
             self.plot_info_var.set(
                 f"{len(series)} minutes so far  •  average {avg:.1f} blinks/min "
                 f"(completed, reliable minutes)  •  peak {peak} blinks/min in minute "
                 f"{peak_minute}  •  total {self.total_blinks} blinks  •  "
                 f"away {int(away_total // 60)}m {int(away_total % 60)}s"
                 + (f"  •  {n_unreliable} unreliable minute(s) marked ✕"
-                   if n_unreliable else ""))
+                   if n_unreliable else "")
+                + act_text)
 
     def save_per_minute_csv(self):
         elapsed = self.elapsed_seconds()
@@ -883,7 +1078,7 @@ class BlinkDetectorApp(tk.Tk):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["minute", "blinks_in_minute", "cumulative_blinks",
-                             "away_seconds_in_minute", "reliable",
+                             "away_seconds_in_minute", "reliable", "activity",
                              "is_current_partial_minute"])
             for i, v in enumerate(series, start=1):
                 cumulative += v
@@ -891,6 +1086,7 @@ class BlinkDetectorApp(tk.Tk):
                 reliable = not (i - 1 < len(flags) and flags[i - 1])
                 writer.writerow([i, v, cumulative, f"{away_s:.1f}",
                                  "yes" if reliable else "no",
+                                 self._dominant_activity(i - 1, elapsed),
                                  "yes" if i == len(series) and len(series) > 1 else ""])
         messagebox.showinfo("Saved", f"Saved per-minute data to:\n{path}")
 
@@ -1042,6 +1238,10 @@ class BlinkDetectorApp(tk.Tk):
         self.away_intervals.clear()
         self.away_start = None
         self.no_face_since = None
+        self.activity_segments.clear()
+        self._activity_color_idx.clear()
+        if self.running:
+            self._open_activity_segment(0.0)
 
     def save_csv(self):
         if not self.blink_timestamps:
@@ -1060,10 +1260,11 @@ class BlinkDetectorApp(tk.Tk):
         with open(path, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["blink_number", "seconds_since_first_blink",
-                             "approx_wall_time", "cumulative_blinks"])
+                             "approx_wall_time", "activity", "cumulative_blinks"])
             for i, t in enumerate(self.blink_timestamps, start=1):
                 wall = datetime.fromtimestamp(now_ts - (elapsed - t))
-                writer.writerow([i, f"{t - ref:.2f}", wall.strftime("%Y-%m-%d %H:%M:%S"), i])
+                writer.writerow([i, f"{t - ref:.2f}", wall.strftime("%Y-%m-%d %H:%M:%S"),
+                                 self.activity_at(t, elapsed), i])
 
         # Also write a summary line the user can keep
         elapsed = self.elapsed_seconds()
@@ -1080,6 +1281,14 @@ class BlinkDetectorApp(tk.Tk):
             if present > 0:
                 f.write(f"Average (present time): {self.total_blinks/(present/60):.1f} blinks/min "
                         f"({self.total_blinks/(present/3600):,.0f} blinks/hour)\n")
+            act = self.activity_stats(elapsed)
+            if act:
+                f.write("\nBy activity (present time only):\n")
+                for s in act:
+                    mins = s["seconds"] / 60.0
+                    bpm = s["blinks"] / mins if mins > 0 else 0.0
+                    f.write(f"  {s['name']}: {mins:.1f} min, {s['blinks']} blinks, "
+                            f"{bpm:.1f} blinks/min ({bpm * 60:,.0f} blinks/hour)\n")
         messagebox.showinfo("Saved", f"Saved:\n{path}\n{summary_path}")
 
     def on_close(self):
